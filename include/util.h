@@ -1,12 +1,12 @@
 /*
  * PgBouncer - Lightweight connection pooler for PostgreSQL.
- * 
+ *
  * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
- * 
+ *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
@@ -37,8 +37,6 @@ int log_socket_prefix(enum LogLevel lev, void *ctx, char *dst, unsigned int dstl
  * password tools
  */
 #define MD5_PASSWD_LEN  35
-#define isMD5(passwd) (memcmp(passwd, "md5", 3) == 0 \
-		&& strlen(passwd) == MD5_PASSWD_LEN)
 void pg_md5_encrypt(const char *part1, const char *part2, size_t p2len, char *dest);
 void get_random_bytes(uint8_t *dest, int len);
 
@@ -61,4 +59,3 @@ void safe_evtimer_add(struct event *ev, struct timeval *tv);
 	if (unlikely(needed >= (dstlen))) \
 		log_warning("bug in %s:%d - string truncated", __FILE__, __LINE__); \
 } while (0)
-

@@ -1,12 +1,12 @@
 /*
  * PgBouncer - Lightweight connection pooler for PostgreSQL.
- * 
+ *
  * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
- * 
+ *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
@@ -115,11 +115,13 @@ bool tune_socket(int sock, bool is_unix)
 {
 	int res;
 	int val;
+	const char *errpos;
 	bool ok;
 
 	/*
 	 * Generic stuff + nonblock.
 	 */
+	errpos = "socket_setup";
 	ok = socket_setup(sock, true);
 	if (!ok)
 		goto fail;
@@ -133,20 +135,39 @@ bool tune_socket(int sock, bool is_unix)
 	/*
 	 * TCP Keepalive
 	 */
+	errpos = "socket_set_keepalive";
 	ok = socket_set_keepalive(sock, cf_tcp_keepalive, cf_tcp_keepidle,
 				  cf_tcp_keepintvl, cf_tcp_keepcnt);
 	if (!ok)
 		goto fail;
 
 	/*
+	 * TCP user timeout
+	 */
+	if (cf_tcp_user_timeout) {
+		errpos = "setsockopt/TCP_USER_TIMEOUT";
+#ifdef TCP_USER_TIMEOUT
+		val = cf_tcp_user_timeout;
+		res = setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT, &val, sizeof(val));
+		if (res < 0)
+			goto fail;
+#else
+		errno = EINVAL;
+		goto fail;
+#endif
+	}
+
+	/*
 	 * set in-kernel socket buffer size
 	 */
 	if (cf_tcp_socket_buffer) {
 		val = cf_tcp_socket_buffer;
+		errpos = "setsockopt/SO_SNDBUF";
 		res = setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &val, sizeof(val));
 		if (res < 0)
 			goto fail;
 		val = cf_tcp_socket_buffer;
+		errpos = "setsockopt/SO_RCVBUF";
 		res = setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &val, sizeof(val));
 		if (res < 0)
 			goto fail;
@@ -156,12 +177,13 @@ bool tune_socket(int sock, bool is_unix)
 	 * Turn off kernel buffering, each send() will be one packet.
 	 */
 	val = 1;
+	errpos = "setsockopt/TCP_NODELAY";
 	res = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
 	if (res < 0)
 		goto fail;
 	return true;
 fail:
-	log_warning("tune_socket(%d) failed: %s", sock, strerror(errno));
+	log_warning("%s(%d) failed: %s", errpos, sock, strerror(errno));
 	return false;
 }
 
@@ -174,7 +196,7 @@ bool strlist_contains(const char *liststr, const char *str)
 {
 	int c, len = strlen(str);
 	const char *p, *listpos = liststr;
-	
+
 loop:
 	/* find string fragment, later check if actual token */
 	p = strstr(listpos, str);
@@ -267,13 +289,13 @@ void safe_evtimer_add(struct event *ev, struct timeval *tv)
 {
 	int res;
 	struct timer_slot *ts;
-	
+
 	res = evtimer_add(ev, tv);
 	if (res >= 0)
 		return;
 
 	if (timer_backup_used >= TIMER_BACKUP_SLOTS)
-		fatal_perror("TIMER_BACKUP_SLOTS full");
+		fatal("TIMER_BACKUP_SLOTS full");
 
 	ts = &timer_backup_list[timer_backup_used++];
 	ts->ev = ev;
@@ -440,6 +462,3 @@ const char *pga_details(const PgAddr *a, char *dst, int dstlen)
 	}
 	return dst;
 }
-
-
-

@@ -1,12 +1,12 @@
 /*
  * PgBouncer - Lightweight connection pooler for PostgreSQL.
- * 
+ *
  * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
- * 
+ *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
@@ -52,9 +52,6 @@ typedef struct SBufIO SBufIO;
 typedef bool (*sbuf_cb_t)(SBuf *sbuf,
 			SBufEvent evtype,
 			struct MBuf *mbuf);
-
-/* for some reason, libevent has no typedef for callback */
-typedef void (*sbuf_libevent_cb)(int, short, void *);
 
 struct SBufIO {
 	int (*sbufio_recv)(SBuf *sbuf, void *buf, unsigned int len);
@@ -111,8 +108,8 @@ void sbuf_prepare_fetch(SBuf *sbuf, unsigned amount);
 
 bool sbuf_answer(SBuf *sbuf, const void *buf, unsigned len)  _MUSTCHECK;
 
-bool sbuf_continue_with_callback(SBuf *sbuf, sbuf_libevent_cb cb)  _MUSTCHECK;
-bool sbuf_use_callback_once(SBuf *sbuf, short ev, sbuf_libevent_cb user_cb) _MUSTCHECK;
+bool sbuf_continue_with_callback(SBuf *sbuf, event_callback_fn cb)  _MUSTCHECK;
+bool sbuf_use_callback_once(SBuf *sbuf, short ev, event_callback_fn user_cb) _MUSTCHECK;
 
 /*
  * Returns true if SBuf is has no data buffered
@@ -148,4 +145,3 @@ static inline int sbuf_op_close(SBuf *sbuf)
 }
 
 void sbuf_cleanup(void);
-

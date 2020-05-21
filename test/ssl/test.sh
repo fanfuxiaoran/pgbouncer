@@ -1,5 +1,7 @@
 #! /bin/sh
 
+cd $(dirname $0)
+
 rm -rf TestCA1
 
 which psql
@@ -26,38 +28,66 @@ export EF_ALLOW_MALLOC_0=1
 
 mkdir -p tmp
 
-BOUNCER_LOG=tmp/test.log
+BOUNCER_LOG=test.log
 BOUNCER_INI=test.ini
-BOUNCER_PID=tmp/test.pid
+BOUNCER_PID=test.pid
 BOUNCER_PORT=`sed -n '/^listen_port/s/listen_port.*=[^0-9]*//p' $BOUNCER_INI`
-BOUNCER_EXE="../../pgbouncer"
+BOUNCER_EXE="$BOUNCER_EXE_PREFIX ../../pgbouncer"
 
-LOGDIR=tmp
-NC_PORT=6668
+LOGDIR=log
+PG_PORT=6666
 PG_LOG=$LOGDIR/pg.log
 
-################################
-#  return code
-################################
-result=0
+pgctl() {
+	pg_ctl -w -o "-p $PG_PORT" -D $PGDATA $@ >>$PG_LOG 2>&1
+}
 
-rm -f core
 ulimit -c unlimited
-for f in  tmp/test.pid; do
-	test -f $f && { kill `cat $f` || true; }
-done
+
+# System configuration checks
+SED_ERE_OP='-E'
+case `uname` in
+Linux)
+	SED_ERE_OP='-r'
+	;;
+esac
+
+pg_majorversion=$(initdb --version | sed -n $SED_ERE_OP 's/.* ([0-9]+).*/\1/p')
+if test $pg_majorversion -ge 10; then
+	pg_supports_scram=true
+else
+	pg_supports_scram=false
+fi
+
+stopit() {
+	local pid
+	if test -f "$1"; then
+		pid=`head -n1 "$1"`
+		kill $pid
+		while kill -0 $pid 2>/dev/null; do sleep 0.1; done
+		rm -f "$1"
+	fi
+}
+
+stopit test.pid
+stopit pgdata/postmaster.pid
 
 mkdir -p $LOGDIR
-rm -fr $BOUNCER_LOG $PG_LOG
+rm -f $BOUNCER_LOG $PG_LOG
+rm -rf $PGDATA
 
-if [ ! -d $${PGDATA} ]; then
-	#sed -r -i "/unix_socket_director/s:.*(unix_socket_director.*=).*:\\1 '/tmp':" ${PGDATA}/postgresql.conf
-	#echo "port = $PG_PORT" >> ${PGDATA}/postgresql.conf
-	#echo "log_connections = on" >> ${PGDATA}/postgresql.conf
-	#echo "log_disconnections = on" >> ${PGDATA}/postgresql.conf
+if [  -d $PGDATA ]; then
+	#echo "initdb"
+	#mkdir $PGDATA
+	#initdb --nosync >> $PG_LOG 2>&1
+	#sed -r -i "/unix_socket_director/s:.*(unix_socket_director.*=).*:\\1 '/tmp':" pgdata/postgresql.conf
+	#echo "port = $PG_PORT" >> pgdata/postgresql.conf
+	echo "log_connections = on" >> ${PGDATA}/postgresql.conf
+	echo "log_disconnections = on" >> ${PGDATA}/postgresql.conf
 	cp ${PGDATA}/postgresql.conf ${PGDATA}/postgresql.conf.orig
 	cp ${PGDATA}/pg_hba.conf ${PGDATA}/pg_hba.conf.orig
 	cp ${PGDATA}/pg_ident.conf ${PGDATA}/pg_ident.conf.orig
+
 	cp -p TestCA1/sites/01-localhost.crt ${PGDATA}/server.crt
 	cp -p TestCA1/sites/01-localhost.key ${PGDATA}/server.key
 	cp -p TestCA1/ca.crt ${PGDATA}/root.crt
@@ -69,24 +99,24 @@ if [ ! -d $${PGDATA} ]; then
 
 	chmod 600 ${PGDATA}/server.key
 	chmod 600 tmp/userlist.txt
+
 fi
 
+# pgctl start
+
 echo "createdb"
-psql -p $PG_PORT -l | grep p0 > /dev/null || {
-	psql -p $PG_PORT -c "create user bouncer" template1
+psql -X -p $PG_PORT -l | grep p0 > /dev/null || {
+	psql -X -o /dev/null -p $PG_PORT -c "create user bouncer" template1
 	createdb -p $PG_PORT p0
 	createdb -p $PG_PORT p1
 }
-
-$BOUNCER_EXE -d $BOUNCER_INI
-sleep 1
 
 reconf_bouncer() {
 	cp test.ini tmp/test.ini
 	for ln in "$@"; do
 		echo "$ln" >> tmp/test.ini
 	done
-	test -f tmp/test.pid && kill `cat tmp/test.pid`
+	test -f test.pid && kill `cat test.pid`
 	sleep 1
 	$BOUNCER_EXE -v -d tmp/test.ini
 }
@@ -126,33 +156,45 @@ die() {
 }
 
 admin() {
-	psql -h /tmp -U pgbouncer pgbouncer -c "$@;" || die "Cannot contact bouncer!"
+	psql -X -h /tmp -U pgbouncer pgbouncer -c "$@;" || die "Cannot contact bouncer!"
 }
 
 runtest() {
-	echo -n "`date` running $1 ... "
-	eval $1 >$LOGDIR/$1.log 2>&1
-	if [ $? -eq 0 ]; then
+	local status
+
+	$BOUNCER_EXE -d $BOUNCER_INI
+	until psql -X -h /tmp -U pgbouncer -d pgbouncer -c "show version" 2>/dev/null 1>&2; do sleep 0.1; done
+
+	printf "`date` running $1 ... "
+	eval $1 >$LOGDIR/$1.out 2>&1
+	status=$?
+	if [ $status -eq 0 ]; then
 		echo "ok"
+	elif [ $status -eq 77 ]; then
+		echo "skipped"
+		status=0
 	else
 		result=1
 		echo "FAILED"
+		cat $LOGDIR/$1.out | sed 's/^/# /'
 	fi
-	date >> $LOGDIR/$1.log
+	date >> $LOGDIR/$1.out
 
 	# allow background processing to complete
 	wait
-	# start with fresh config
-	kill -HUP `cat $BOUNCER_PID`
+
+	stopit test.pid
+	mv $BOUNCER_LOG $LOGDIR/$1.log
+
+	return $status
 }
 
 psql_pg() {
-	psql -U bouncer -h 127.0.0.1 -p $PG_PORT "$@"
+	psql -X -U bouncer -h 127.0.0.1 -p $PG_PORT "$@"
 }
 
 psql_bouncer() {
-	PGUSER=bouncer psql "$@"
-
+	PGUSER=bouncer PGPASSWORD=zzz psql -X "$@"
 }
 
 # server_lifetime
@@ -246,23 +288,45 @@ test_client_ssl_auth() {
 	return $rc
 }
 
+test_client_ssl_scram() {
+	$pg_supports_scram || return 77
+
+	reconf_bouncer "auth_type = scram-sha-256" "server_tls_sslmode = prefer" \
+		"client_tls_sslmode = require" \
+		"client_tls_key_file = TestCA1/sites/01-localhost.key" \
+		"client_tls_cert_file = TestCA1/sites/01-localhost.crt"
+	reconf_pgsql "ssl=on" "ssl_ca_file='root.crt'"
+	psql_bouncer -q -d "dbname=p0 sslmode=verify-full sslrootcert=TestCA1/ca.crt" -c "select 'client-ssl-connect'" | tee tmp/test.tmp 2>&1
+	grep -q "client-ssl-connect"  tmp/test.tmp
+	rc=$?
+	return $rc
+}
+
 testlist="
 test_server_ssl
 test_server_ssl_verify
 test_server_ssl_pg_auth
 test_client_ssl
-test_client_ssl_ca
+test_client_ssl_verify
 test_client_ssl_auth
+test_client_ssl_scram
 "
 if [ $# -gt 0 ]; then
 	testlist="$*"
 fi
 
+total_status=0
 for test in $testlist
 do
 	runtest $test
+	status=$?
+	if [ $status -ne 0 ]; then
+		total_status=1
+	fi
 done
 
 complete
-exit $result
+
+exit $total_status
+
 # vim: sts=0 sw=8 noet nosmarttab:

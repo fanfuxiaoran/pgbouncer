@@ -1,12 +1,12 @@
 /*
  * PgBouncer - Lightweight connection pooler for PostgreSQL.
- * 
+ *
  * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
- * 
+ *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
@@ -45,14 +45,14 @@ void takeover_finish(void)
 	socket_set_nonblocking(fd, 0);
 	SEND_generic(res, old_bouncer, 'Q', "s", "SHUTDOWN;");
 	if (!res)
-		fatal("failed to send SHUTDOWN;");
+		die("failed to send SHUTDOWN;");
 
 	while (1) {
 		got = safe_recv(fd, buf, sizeof(buf), 0);
 		if (got == 0)
 			break;
 		if (got < 0)
-			fatal_perror("sky is falling - error while waiting result from SHUTDOWN");
+			die("sky is falling - error while waiting result from SHUTDOWN: %s", strerror(errno));
 	}
 
 	disconnect_server(old_bouncer, false, "disko over");
@@ -213,7 +213,7 @@ static void next_command(PgSocket *bouncer, struct MBuf *pkt)
 {
 	bool res = true;
 	const char *cmd;
-	
+
 	if (!mbuf_get_string(pkt, &cmd))
 		fatal("bad result pkt");
 
@@ -240,7 +240,7 @@ static void takeover_parse_data(PgSocket *bouncer,
 {
 	struct cmsghdr *cmsg;
 	PktHdr pkt;
-	
+
 	cmsg = msg->msg_controllen ? CMSG_FIRSTHDR(msg) : NULL;
 
 	while (mbuf_avail_for_read(data) > 0) {
@@ -286,7 +286,7 @@ static void takeover_parse_data(PgSocket *bouncer,
  *
  * use always recvmsg, to keep code simpler
  */
-static void takeover_recv_cb(int sock, short flags, void *arg)
+static void takeover_recv_cb(evutil_socket_t sock, short flags, void *arg)
 {
 	PgSocket *bouncer = container_of(arg, PgSocket, sbuf);
 	uint8_t data_buf[STARTUP_BUF * 2];
@@ -325,7 +325,7 @@ bool takeover_login(PgSocket *bouncer)
 {
 	bool res;
 
-	slog_info(bouncer, "Login OK, sending SUSPEND");
+	slog_info(bouncer, "login OK, sending SUSPEND");
 	SEND_generic(res, bouncer, 'Q', "s", "SUSPEND;");
 	if (res) {
 		/* use own callback */
@@ -357,4 +357,3 @@ void takeover_login_failed(void)
 {
 	fatal("login failed");
 }
-

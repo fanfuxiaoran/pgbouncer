@@ -12,10 +12,15 @@
 /test/.objs
 /test/hba_test
 /test/log
+/test/pgdata/
 /test/test.log
 /test/test.pid
-/test/ssl/tmp
-/test/ssl/TestCA1
+/test/ssl/log
+/test/ssl/tmp/
+/test/ssl/pgdata/
+/test/ssl/test.log
+/test/ssl/test.pid
+/test/ssl/TestCA1/
 
 *.html
 *.xml

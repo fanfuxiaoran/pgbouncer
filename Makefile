@@ -17,12 +17,18 @@ pgbouncer_SOURCES = \
 	src/pooler.c \
 	src/proto.c \
 	src/sbuf.c \
+	src/scram.c \
 	src/server.c \
 	src/stats.c \
 	src/system.c \
 	src/takeover.c \
 	src/util.c \
 	src/varcache.c \
+	src/common/base64.c \
+	src/common/saslprep.c \
+	src/common/scram-common.c \
+	src/common/unicode_norm.c \
+	src/common/wchar.c \
 	include/admin.h \
 	include/bouncer.h \
 	include/client.h \
@@ -37,21 +43,29 @@ pgbouncer_SOURCES = \
 	include/pooler.h \
 	include/proto.h \
 	include/sbuf.h \
+	include/scram.h \
 	include/server.h \
 	include/stats.h \
 	include/system.h \
 	include/takeover.h \
 	include/util.h \
-	include/varcache.h
+	include/varcache.h \
+	include/common/base64.h \
+	include/common/pg_wchar.h \
+	include/common/postgres_compat.h \
+	include/common/saslprep.h \
+	include/common/scram-common.h \
+	include/common/unicode_norm.h \
+	include/common/unicode_norm_table.h
 
-pgbouncer_CPPFLAGS = -Iinclude $(CARES_CFLAGS) $(TLS_CPPFLAGS)
+pgbouncer_CPPFLAGS = -Iinclude $(CARES_CFLAGS) $(LIBEVENT_CFLAGS) $(TLS_CPPFLAGS)
 
 # include libusual sources directly
 AM_FEATURES = libusual
 pgbouncer_EMBED_LIBUSUAL = 1
 
 # docs to install as-is
-#dist_doc_DATA = README.rst NEWS.rst etc/pgbouncer.ini etc/userlist.txt
+dist_doc_DATA = README.md NEWS.md etc/pgbouncer.ini etc/userlist.txt
 
 #DISTCLEANFILES = config.mak config.status lib/usual/config.h config.log
 
@@ -61,8 +75,7 @@ pgbouncer_EMBED_LIBUSUAL = 1
 # files in tgz
 EXTRA_DIST = AUTHORS COPYRIGHT Makefile config.mak.in config.sub config.guess \
 	     install-sh autogen.sh configure configure.ac \
-	     debian/compat debian/changelog debian/control debian/rules debian/copyright \
-	     etc/mkauth.py etc/example.debian.init.sh \
+	     etc/mkauth.py etc/optscan.sh etc/example.debian.init.sh \
 	     win32/Makefile \
 	     $(LIBUSUAL_DIST)
 
@@ -78,13 +91,13 @@ LIBUSUAL_DIST = $(filter-out %/config.h, $(sort $(wildcard \
 		lib/README lib/COPYRIGHT \
 		lib/find_modules.sh )))
 
+pgbouncer_LDFLAGS := $(TLS_LDFLAGS)
+pgbouncer_LDADD := $(CARES_LIBS) $(LIBEVENT_LIBS) $(TLS_LIBS) $(LIBS)
+LIBS :=
+
 #
 # win32
 #
-
-pgbouncer_LDFLAGS := $(TLS_LDFLAGS)
-pgbouncer_LDADD := $(CARES_LIBS) $(TLS_LIBS) $(LIBS)
-LIBS :=
 
 EXTRA_pgbouncer_SOURCES = win32/win32support.c win32/win32support.h
 EXTRA_PROGRAMS = pgbevent
@@ -118,11 +131,12 @@ config.mak:
 	@echo "Please run ./configure"
 	@exit 1
 
-deb:
-	debuild -b -us -uc
+check: all
+	etc/optscan.sh
+	$(MAKE) -C test check
 
 w32arch = i686-w64-mingw32
-w32zip = pgbouncer-$(PACKAGE_VERSION)-win32.zip
+w32zip = $(PACKAGE_TARNAME)-$(PACKAGE_VERSION)-win32.zip
 zip: configure clean
 	rm -rf buildexe
 	mkdir buildexe
@@ -130,8 +144,8 @@ zip: configure clean
 		&& ../configure --host=$(w32arch) --disable-debug \
 			--without-openssl \
 			--without-cares \
-			--with-libevent=/opt/apps/win32 --enable-evdns \
-		&& make \
+			--enable-evdns \
+		&& $(MAKE) \
 		&& $(w32arch)-strip pgbouncer.exe pgbevent.dll \
 		&& zip pgbouncer.zip pgbouncer.exe pgbevent.dll doc/*.html
 	zip -l buildexe/pgbouncer.zip etc/pgbouncer.ini etc/userlist.txt
@@ -140,7 +154,7 @@ zip: configure clean
 zip-up: $(w32zip)
 	rsync $(w32zip) pgf:web/pgbouncer/htdocs/win32/
 
-tgz = pgbouncer-$(PACKAGE_VERSION).tar.gz
+tgz = $(PACKAGE_TARNAME)-$(PACKAGE_VERSION).tar.gz
 tgz-up: $(tgz)
 	rsync $(tgz) pgf:web/pgbouncer/htdocs/testing/
 
@@ -149,10 +163,9 @@ tags:
 	ctags src/*.c include/*.h lib/usual/*.[ch] lib/usual/*/*.[ch]
 
 htmls:
-	for f in *.rst doc/*.rst; do \
-		mkdir -p html && rst2html $$f > html/`basename $$f`.html; \
+	for f in *.md doc/*.md; do \
+		mkdir -p html && $(PANDOC) $$f -o html/`basename $$f`.html; \
 	done
 
 doc/pgbouncer.1 doc/pgbouncer.5:
 	$(MAKE) -C doc
-

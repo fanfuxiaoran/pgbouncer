@@ -1,12 +1,12 @@
 /*
  * PgBouncer - Lightweight connection pooler for PostgreSQL.
- * 
+ *
  * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
- * 
+ *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
@@ -21,6 +21,7 @@
  */
 
 #include "bouncer.h"
+#include "scram.h"
 
 /*
  * parse protocol header from struct MBuf
@@ -75,6 +76,8 @@ bool get_header(struct MBuf *data, PktHdr *pkt)
 			type = PKT_CANCEL;
 		} else if (code == PKT_SSLREQ) {
 			type = PKT_SSLREQ;
+		} else if (code == PKT_GSSENCREQ) {
+			type = PKT_GSSENCREQ;
 		} else if ((code >> 16) == 3 && (code & 0xFFFF) < 2) {
 			type = PKT_STARTUP;
 		} else if (code == PKT_STARTUP_V2) {
@@ -118,7 +121,7 @@ bool send_pooler_error(PgSocket *client, bool send_ready, const char *msg)
 	PktBuf buf;
 
 	if (cf_log_pooler_errors)
-		slog_warning(client, "Pooler Error: %s", msg);
+		slog_warning(client, "pooler error: %s", msg);
 
 	pktbuf_static(&buf, tmpbuf, sizeof(tmpbuf));
 	pktbuf_write_generic(&buf, 'E', "cscscsc",
@@ -281,15 +284,147 @@ static bool login_md5_psw(PgSocket *server, const uint8_t *salt)
 	PgUser *user = get_srv_psw(server);
 
 	slog_debug(server, "P: send md5 password");
-	if (!isMD5(user->passwd)) {
+
+	switch (get_password_type(user->passwd)) {
+	case PASSWORD_TYPE_PLAINTEXT:
 		pg_md5_encrypt(user->passwd, user->name, strlen(user->name), txt);
 		src = txt + 3;
-	} else {
+		break;
+	case PASSWORD_TYPE_MD5:
 		src = user->passwd + 3;
+		break;
+	default:
+		slog_error(server, "cannot do MD5 authentication: wrong password type");
+		kill_pool_logins(server->pool, "server login failed: wrong password type");
+		return false;
 	}
+
 	pg_md5_encrypt(src, (char *)salt, 4, txt);
 
 	return send_password(server, txt);
+}
+
+static bool login_scram_sha_256(PgSocket *server)
+{
+	PgUser *user = get_srv_psw(server);
+	bool res;
+	char *client_first_message = NULL;
+
+	if (get_password_type(user->passwd) != PASSWORD_TYPE_PLAINTEXT) {
+		slog_error(server, "cannot do SCRAM authentication: password is not plain text");
+		kill_pool_logins(server->pool, "server login failed: wrong password type");
+		return false;
+	}
+
+	if (server->scram_state.client_nonce)
+	{
+		slog_error(server, "protocol error: duplicate AuthenticationSASL message from server");
+		return false;
+	}
+
+	client_first_message = build_client_first_message(&server->scram_state);
+	if (!client_first_message)
+		return false;
+
+	slog_debug(server, "SCRAM client-first-message = \"%s\"", client_first_message);
+	slog_debug(server, "P: send SASLInitialResponse");
+	SEND_SASLInitialResponseMessage(res, server, "SCRAM-SHA-256", client_first_message);
+
+	free(client_first_message);
+	return res;
+}
+
+static bool login_scram_sha_256_cont(PgSocket *server, unsigned datalen, const uint8_t *data)
+{
+	PgUser *user = get_srv_psw(server);
+	char *ibuf = NULL;
+	char *input;
+	char *server_nonce;
+	int saltlen;
+	char *salt = NULL;
+	int iterations;
+	bool res;
+	char *client_final_message = NULL;
+
+	if (!server->scram_state.client_nonce)
+	{
+		slog_error(server, "protocol error: AuthenticationSASLContinue without prior AuthenticationSASL");
+		return false;
+	}
+
+	if (server->scram_state.server_first_message)
+	{
+		slog_error(server, "SCRAM exchange protocol error: received second AuthenticationSASLContinue");
+		return false;
+	}
+
+	ibuf = malloc(datalen + 1);
+	if (ibuf == NULL)
+		return false;
+	memcpy(ibuf, data, datalen);
+	ibuf[datalen] = '\0';
+
+	input = ibuf;
+	slog_debug(server, "SCRAM server-first-message = \"%s\"", input);
+	if (!read_server_first_message(server, input,
+				       &server_nonce, &salt, &saltlen, &iterations))
+		goto failed;
+
+	client_final_message = build_client_final_message(&server->scram_state,
+							  user->passwd, server_nonce,
+							  salt, saltlen, iterations);
+
+	free(salt);
+	free(ibuf);
+
+	slog_debug(server, "SCRAM client-final-message = \"%s\"", client_final_message);
+	slog_debug(server, "P: send SASLResponse");
+	SEND_SASLResponseMessage(res, server, client_final_message);
+
+	free(client_final_message);
+	return res;
+failed:
+	free(salt);
+	free(ibuf);
+	free(client_final_message);
+	return false;
+}
+
+static bool login_scram_sha_256_final(PgSocket *server, unsigned datalen, const uint8_t *data)
+{
+	char *ibuf = NULL;
+	char *input;
+	char ServerSignature[SHA256_DIGEST_LENGTH];
+
+	if (!server->scram_state.server_first_message)
+	{
+		slog_error(server, "protocol error: AuthenticationSASLFinal without prior AuthenticationSASLContinue");
+		return false;
+	}
+
+	ibuf = malloc(datalen + 1);
+	if (ibuf == NULL)
+		return false;
+	memcpy(ibuf, data, datalen);
+	ibuf[datalen] = '\0';
+
+	input = ibuf;
+	slog_debug(server, "SCRAM server-final-message = \"%s\"", input);
+	if (!read_server_final_message(server, input, ServerSignature))
+		goto failed;
+
+	if (!verify_server_signature(&server->scram_state, ServerSignature))
+	{
+		slog_error(server, "invalid server signature");
+		kill_pool_logins(server->pool, "server login failed: invalid server signature");
+		return false;
+	}
+
+	free(ibuf);
+	return true;
+failed:
+	free(ibuf);
+	return false;
 }
 
 /* answer server authentication request */
@@ -320,6 +455,56 @@ bool answer_authreq(PgSocket *server, PktHdr *pkt)
 			return false;
 		res = login_md5_psw(server, salt);
 		break;
+	case AUTH_SASL:
+	{
+		bool selected_mechanism = false;
+
+		slog_debug(server, "S: req SASL");
+
+		do {
+			const char *mech;
+
+			if (!mbuf_get_string(&pkt->data, &mech))
+				return false;
+			if (!mech[0])
+				break;
+			slog_debug(server, "S: SASL advertised mechanism: %s", mech);
+			if (strcmp(mech, "SCRAM-SHA-256") == 0)
+				selected_mechanism = true;
+		} while (!selected_mechanism);
+
+		if (!selected_mechanism) {
+			slog_error(server, "none of the server's SASL authentication mechanisms are supported");
+			kill_pool_logins(server->pool, "server login failed: none of the server's SASL authentication mechanisms are supported");
+		} else
+			res = login_scram_sha_256(server);
+		break;
+	}
+	case AUTH_SASL_CONT:
+	{
+		unsigned len;
+		const uint8_t *data;
+
+		slog_debug(server, "S: SASL cont");
+		len = mbuf_avail_for_read(&pkt->data);
+		if (!mbuf_get_bytes(&pkt->data, len, &data))
+			return false;
+		res = login_scram_sha_256_cont(server, len, data);
+		break;
+	}
+	case AUTH_SASL_FIN:
+	{
+		unsigned len;
+		const uint8_t *data;
+
+		slog_debug(server, "S: SASL final");
+		len = mbuf_avail_for_read(&pkt->data);
+		if (!mbuf_get_bytes(&pkt->data, len, &data))
+			return false;
+		res = login_scram_sha_256_final(server, len, data);
+		free_scram_state(&server->scram_state);
+		break;
+	}
 	default:
 		slog_error(server, "unknown/unsupported auth method: %d", cmd);
 		res = false;
@@ -412,4 +597,3 @@ int scan_text_result(struct MBuf *pkt, const char *tupdesc, ...)
 
 	return ncol;
 }
-

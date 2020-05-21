@@ -34,10 +34,22 @@
 #include <usual/socket.h>
 #include <usual/safeio.h>
 #include <usual/mbuf.h>
-#include <usual/event.h>
 #include <usual/strpool.h>
 
-#define FULLVER   PACKAGE_NAME " version " PACKAGE_VERSION
+#include <event2/event.h>
+#include <event2/event_struct.h>
+
+#ifdef USE_SYSTEMD
+#include <systemd/sd-daemon.h>
+#else
+#define sd_notify(ue, s)
+#define sd_notifyf(ue, f, ...)
+#endif
+
+
+/* global libevent handle */
+extern struct event_base *pgb_event_base;
+
 
 /* each state corresponds to a list */
 enum SocketState {
@@ -84,6 +96,7 @@ typedef struct PgStats PgStats;
 typedef union PgAddr PgAddr;
 typedef enum SocketState SocketState;
 typedef struct PktHdr PktHdr;
+typedef struct ScramState ScramState;
 
 extern int cf_sbuf_len;
 
@@ -110,32 +123,48 @@ extern int cf_sbuf_len;
 /* to avoid allocations will use static buffers */
 #define MAX_DBNAME	64
 #define MAX_USERNAME	64
-#define MAX_PASSWORD	128
+/* typical SCRAM-SHA-256 verifier takes at least 133 bytes */
+#define MAX_PASSWORD	160
+
+/*
+ * AUTH_* symbols are used for both protocol handling and
+ * configuration settings (auth_type, hba).  Some are only applicable
+ * to one or the other.
+ */
 
 /* no-auth modes */
 #define AUTH_ANY	-1 /* same as trust but without username check */
 #define AUTH_TRUST	AUTH_OK
 
-/* protocol codes */
+/* protocol codes in Authentication* 'R' messages from server */
 #define AUTH_OK		0
-#define AUTH_KRB	2
+#define AUTH_KRB4	1	/* not supported */
+#define AUTH_KRB5	2	/* not supported */
 #define AUTH_PLAIN	3
-#define AUTH_CRYPT	4
+#define AUTH_CRYPT	4	/* not supported */
 #define AUTH_MD5	5
-#define AUTH_CREDS	6
+#define AUTH_SCM_CREDS	6	/* not supported */
+#define AUTH_GSS	7	/* not supported */
+#define AUTH_GSS_CONT	8	/* not supported */
+#define AUTH_SSPI	9	/* not supported */
+#define AUTH_SASL	10
+#define AUTH_SASL_CONT	11
+#define AUTH_SASL_FIN	12
 
 /* internal codes */
-#define AUTH_CERT	7
-#define AUTH_PEER	8
-#define AUTH_HBA	9
-#define AUTH_REJECT	10
-#define AUTH_PAM	11
+#define AUTH_CERT	107
+#define AUTH_PEER	108
+#define AUTH_HBA	109
+#define AUTH_REJECT	110
+#define AUTH_PAM	111
+#define AUTH_SCRAM_SHA_256	112
 
 /* type codes for weird pkts */
 #define PKT_STARTUP_V2  0x20000
 #define PKT_STARTUP     0x30000
 #define PKT_CANCEL      80877102
 #define PKT_SSLREQ      80877103
+#define PKT_GSSENCREQ   80877104
 
 #define POOL_SESSION	0
 #define POOL_TX		1
@@ -234,9 +263,10 @@ struct PgPool {
 
 	usec_t last_lifetime_disconnect;/* last time when server_lifetime was applied */
 
-	/* if last connect failed, there should be delay before next */
+	/* if last connect to server failed, there should be delay before next */
 	usec_t last_connect_time;
 	unsigned last_connect_failed:1;
+	unsigned last_login_failed:1;
 
 	unsigned welcome_msg_ready:1;
 };
@@ -285,6 +315,7 @@ struct PgDatabase {
 	char name[MAX_DBNAME];	/* db name for clients */
 
 	bool db_paused;		/* PAUSE <db>; was issued */
+	bool db_wait_close;	/* WAIT_CLOSE was issued for this database */
 	bool db_dead;		/* used on RELOAD/SIGHUP to later detect removed dbs */
 	bool db_auto;		/* is the database auto-created by autodb_connstr */
 	bool db_disabled;	/* is the database accepting new connections? */
@@ -295,7 +326,7 @@ struct PgDatabase {
 	PgUser *forced_user;	/* if not NULL, the user/psw is forced */
 	PgUser *auth_user;	/* if not NULL, users not in userlist.txt will be looked up on the server */
 
-	const char *host;	/* host or unix socket name */
+	char *host;		/* host or unix socket name */
 	int port;
 
 	int pool_size;		/* max server connections in one pool */
@@ -306,7 +337,7 @@ struct PgDatabase {
 	const char *dbname;	/* server-side name, pointer to inside startup_msg */
 
 	/* startup commands to send to server after connect. malloc-ed */
-	const char *connect_query;
+	char *connect_query;
 
 	usec_t inactive_time;	/* when auto-database became inactive (to kill it after timeout) */
 	unsigned active_stamp;	/* set if autodb has connections */
@@ -371,6 +402,20 @@ struct PgSocket {
 		PgDatabase *db;			/* cache db while doing auth query */
 	};
 
+	struct ScramState {
+		char *client_nonce;
+		char *client_first_message_bare;
+		char *client_final_message_without_proof;
+		char *server_nonce;
+		char *server_first_message;
+		uint8_t	*SaltedPassword;
+		char cbind_flag;
+		int iterations;
+		char *salt;	/* base64-encoded */
+		uint8_t StoredKey[32];	/* SHA256_DIGEST_LENGTH */
+		uint8_t ServerKey[32];
+	} scram_state;
+
 	VarCache vars;		/* state of interesting server parameters */
 
 	SBuf sbuf;		/* stream buffer, must be last */
@@ -419,6 +464,7 @@ extern char * cf_server_reset_query;
 extern int cf_server_reset_query_always;
 extern char * cf_server_check_query;
 extern usec_t cf_server_check_delay;
+extern int cf_server_fast_close;
 extern usec_t cf_server_connect_timeout;
 extern usec_t cf_server_login_retry;
 extern usec_t cf_query_timeout;
@@ -431,6 +477,7 @@ extern int cf_disable_pqexec;
 extern usec_t cf_dns_max_ttl;
 extern usec_t cf_dns_nxdomain_ttl;
 extern usec_t cf_dns_zone_check_period;
+extern char *cf_resolv_conf;
 
 extern int cf_auth_type;
 extern char *cf_auth_file;
@@ -445,6 +492,7 @@ extern char *cf_ignore_startup_params;
 extern char *cf_admin_users;
 extern char *cf_stats_users;
 extern int cf_stats_period;
+extern int cf_log_stats;
 
 extern int cf_pause_mode;
 extern int cf_shutdown;
@@ -453,12 +501,14 @@ extern int cf_reboot;
 extern unsigned int cf_max_packet_size;
 
 extern int cf_sbuf_loopcnt;
+extern int cf_so_reuseport;
 extern int cf_tcp_keepalive;
 extern int cf_tcp_keepcnt;
 extern int cf_tcp_keepidle;
 extern int cf_tcp_keepintvl;
 extern int cf_tcp_socket_buffer;
 extern int cf_tcp_defer_accept;
+extern int cf_tcp_user_timeout;
 
 extern int cf_log_connections;
 extern int cf_log_disconnections;

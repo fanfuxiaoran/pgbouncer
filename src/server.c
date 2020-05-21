@@ -1,12 +1,12 @@
 /*
  * PgBouncer - Lightweight connection pooler for PostgreSQL.
- * 
+ *
  * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
- * 
+ *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
@@ -62,15 +62,10 @@ failed_store:
 }
 
 /* we cannot log in at all, notify clients */
-static void kill_pool_logins(PgPool *pool, PktHdr *errpkt)
+void kill_pool_logins(PgPool *pool, const char *msg)
 {
 	struct List *item, *tmp;
 	PgSocket *client;
-	const char *level, *msg;
-
-	parse_server_error(errpkt, &level, &msg);
-
-	log_warning("server login failed: %s %s", level, msg);
 
 	statlist_for_each_safe(item, &pool->waiting_client_list, tmp) {
 		client = container_of(item, PgSocket, head);
@@ -79,6 +74,16 @@ static void kill_pool_logins(PgPool *pool, PktHdr *errpkt)
 
 		disconnect_client(client, true, "%s", msg);
 	}
+}
+
+/* we cannot log in at all, notify clients with server error */
+static void kill_pool_logins_server_error(PgPool *pool, PktHdr *errpkt)
+{
+	const char *level, *msg;
+
+	parse_server_error(errpkt, &level, &msg);
+	log_warning("server login failed: %s %s", level, msg);
+	kill_pool_logins(pool, msg);
 }
 
 /* process packets on server auth phase */
@@ -102,6 +107,7 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 
 		case 'E':	/* log & ignore errors */
 			log_server_error("S: error while executing exec_on_query", pkt);
+			/* fallthrough */
 		default:	/* ignore rest */
 			sbuf_prepare_skip(sbuf, pkt->len);
 			return true;
@@ -116,7 +122,7 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 
 	case 'E':		/* ErrorResponse */
 		if (!server->pool->welcome_msg_ready)
-			kill_pool_logins(server->pool, pkt);
+			kill_pool_logins_server_error(server->pool, pkt);
 		else
 			log_server_error("S: login failed", pkt);
 
@@ -230,7 +236,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		slog_error(server, "unknown pkt: '%c'", pkt_desc(pkt));
 		disconnect_server(server, true, "unknown pkt");
 		return false;
-	
+
 	/* pooling decisions will be based on this packet */
 	case 'Z':		/* ReadyForQuery */
 
@@ -242,7 +248,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		if (state == 'I')
 			ready = true;
 		else if (pool_pool_mode(server->pool) == POOL_STMT) {
-			disconnect_server(server, true, "Long transactions not allowed");
+			disconnect_server(server, true, "transaction blocks not allowed in statement pooling mode");
 			return false;
 		} else if (state == 'T' || state == 'E') {
 			idle_tx = true;
@@ -288,6 +294,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			disconnect_server(server, true, "invalid server parameter");
 			return false;
 		}
+		/* fallthrough */
 	case 'C':		/* CommandComplete */
 
 		/* ErrorResponse and CommandComplete show end of copy mode */
@@ -491,7 +498,7 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 			disconnect_server(server, true, "bad pkt header");
 			break;
 		}
-		slog_noise(server, "S: pkt '%c', len=%d", pkt_desc(&pkt), pkt.len);
+		slog_noise(server, "read pkt='%c', len=%d", pkt_desc(&pkt), pkt.len);
 
 		server->request_time = get_cached_time();
 		switch (server->state) {
@@ -578,4 +585,3 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 		takeover_login_failed();
 	return res;
 }
-

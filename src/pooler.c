@@ -1,12 +1,12 @@
 /*
  * PgBouncer - Lightweight connection pooler for PostgreSQL.
- * 
+ *
  * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
- * 
+ *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
@@ -120,6 +120,30 @@ static bool add_listen(int af, const struct sockaddr *sa, int salen)
 	}
 #endif
 
+	/*
+	 * If configured, set SO_REUSEPORT or equivalent.  If it's not
+	 * enabled, just leave the socket alone.  (We could also unset
+	 * the socket option in that case, but this area is fairly
+	 * unportable, so perhaps better to avoid it.)
+	 */
+	if (af != AF_UNIX && cf_so_reuseport) {
+#if defined(SO_REUSEPORT)
+		int val = 1;
+		errpos = "setsockopt/SO_REUSEPORT";
+		res = setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val));
+		if (res < 0)
+			goto failed;
+#elif defined(SO_REUSEPORT_LB)
+		int val = 1;
+		errpos = "setsockopt/SO_REUSEPORT_LB";
+		res = setsockopt(sock, SOL_SOCKET, SO_REUSEPORT_LB, &val, sizeof(val));
+		if (res < 0)
+			goto failed;
+#else
+		die("so_reuseport not supported on this platform");
+#endif
+	}
+
 	/* bind it */
 	errpos = "bind";
 	res = bind(sock, sa, salen);
@@ -162,7 +186,7 @@ static bool add_listen(int af, const struct sockaddr *sa, int salen)
 	return true;
 
 failed:
-	log_warning("Cannot listen on %s: %s(): %s",
+	log_warning("cannot listen on %s: %s(): %s",
 		    sa2str(sa, buf, sizeof(buf)),
 		    errpos, strerror(errno));
 	if (sock >= 0)
@@ -187,7 +211,7 @@ static void create_unix_socket(const char *socket_dir, int listen_port)
 	snprintf(lockfile, sizeof(lockfile), "%s.lock", un.sun_path);
 	res = lstat(lockfile, &st);
 	if (res == 0)
-		fatal("unix port %d is in use", listen_port);
+		die("unix port %d is in use", listen_port);
 
 	/* expect old bouncer gone */
 	unlink(un.sun_path);
@@ -244,7 +268,7 @@ void pooler_tune_accept(bool on)
 	}
 }
 
-static void err_wait_func(int sock, short flags, void *arg)
+static void err_wait_func(evutil_socket_t sock, short flags, void *arg)
 {
 	if (cf_pause_mode != P_SUSPEND)
 		resume_pooler();
@@ -275,7 +299,7 @@ static const char *conninfo(const PgSocket *sk)
 }
 
 /* got new connection, associate it with client struct */
-static void pool_accept(int sock, short flags, void *arg)
+static void pool_accept(evutil_socket_t sock, short flags, void *arg)
 {
 	struct ListenSocket *ls = arg;
 	int fd;
@@ -290,7 +314,7 @@ static void pool_accept(int sock, short flags, void *arg)
 	bool is_unix = pga_is_unix(&ls->addr);
 
 	if(!(flags & EV_READ)) {
-		log_warning("No EV_READ in pool_accept");
+		log_warning("no EV_READ in pool_accept");
 		return;
 	}
 loop:
@@ -307,7 +331,7 @@ loop:
 		 * wait a bit, hope that admin resolves somehow
 		 */
 		log_error("accept() failed: %s", strerror(errno));
-		evtimer_set(&ev_err, err_wait_func, NULL);
+		evtimer_assign(&ev_err, pgb_event_base, err_wait_func, NULL);
 		safe_evtimer_add(&ev_err, &err_timeout);
 		suspend_pooler();
 		return;
@@ -390,7 +414,7 @@ void resume_pooler(void)
 		ls = container_of(el, struct ListenSocket, node);
 		if (ls->active)
 			continue;
-		event_set(&ls->ev, ls->fd, EV_READ | EV_PERSIST, pool_accept, ls);
+		event_assign(&ls->ev, pgb_event_base, ls->fd, EV_READ | EV_PERSIST, pool_accept, ls);
 		if (event_add(&ls->ev, NULL) < 0) {
 			log_warning("event_add failed: %s", strerror(errno));
 			return;
@@ -424,7 +448,7 @@ static bool parse_addr(void *arg, const char *addr)
 
 	res = getaddrinfo(addr, service, &hints, &gaires);
 	if (res != 0) {
-		fatal("getaddrinfo('%s', '%d') = %s [%d]", addr ? addr : "*",
+		die("getaddrinfo('%s', '%d') = %s [%d]", addr ? addr : "*",
 		      cf_listen_port, gai_strerror(res), res);
 	}
 
@@ -453,13 +477,13 @@ void pooler_setup(void)
 
 	ok = parse_word_list(cf_listen_addr, parse_addr, NULL);
 	if (!ok)
-		fatal("failed to parse listen_addr list: %s", cf_listen_addr);
+		die("failed to parse listen_addr list: %s", cf_listen_addr);
 
 	if (cf_unix_socket_dir && *cf_unix_socket_dir)
 		create_unix_socket(cf_unix_socket_dir, cf_listen_port);
 
 	if (!statlist_count(&sock_list))
-		fatal("nowhere to listen on");
+		die("nowhere to listen on");
 
 	resume_pooler();
 }
@@ -478,4 +502,3 @@ bool for_each_pooler_fd(pooler_cb cbfunc, void *arg)
 	}
 	return true;
 }
-

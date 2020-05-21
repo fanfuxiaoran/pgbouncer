@@ -1,12 +1,12 @@
 /*
  * PgBouncer - Lightweight connection pooler for PostgreSQL.
- * 
+ *
  * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
- * 
+ *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
@@ -154,7 +154,7 @@ static void launch_recheck(PgPool *pool)
 
 	if (need_check) {
 		/* send test query, wait for result */
-		slog_debug(server, "P: Checking: %s", q);
+		slog_debug(server, "P: checking: %s", q);
 		change_server_state(server, SV_TESTED);
 		SEND_generic(res, server, 'Q', "s", q);
 		if (!res)
@@ -254,6 +254,43 @@ static int per_loop_suspend(PgPool *pool, bool force_suspend)
 }
 
 /*
+ * Count the servers in server_list that have close_needed set.
+ */
+static int count_close_needed(struct StatList *server_list)
+{
+	struct List *item;
+	PgSocket *server;
+	int count = 0;
+
+	statlist_for_each(item, server_list) {
+		server = container_of(item, PgSocket, head);
+		if (server->close_needed)
+			count++;
+	}
+
+	return count;
+}
+
+/*
+ * Per-loop tasks for WAIT_CLOSE
+ */
+static int per_loop_wait_close(PgPool *pool)
+{
+	int count = 0;
+
+	if (pool->db->admin)
+		return 0;
+
+	count += count_close_needed(&pool->active_server_list);
+	count += count_close_needed(&pool->idle_server_list);
+	count += count_close_needed(&pool->new_server_list);
+	count += count_close_needed(&pool->tested_server_list);
+	count += count_close_needed(&pool->used_server_list);
+
+	return count;
+}
+
+/*
  * this function is called for each event loop.
  */
 void per_loop_maint(void)
@@ -261,7 +298,9 @@ void per_loop_maint(void)
 	struct List *item;
 	PgPool *pool;
 	int active = 0;
+	int waiting_count = 0;
 	int partial_pause = 0;
+	int partial_wait = 0;
 	bool force_suspend = false;
 
 	if (cf_pause_mode == P_SUSPEND && cf_suspend_timeout > 0) {
@@ -290,6 +329,11 @@ void per_loop_maint(void)
 			active += per_loop_suspend(pool, force_suspend);
 			break;
 		}
+
+		if (pool->db->db_wait_close) {
+			partial_wait = 1;
+			waiting_count += per_loop_wait_close(pool);
+		}
 	}
 
 	switch (cf_pause_mode) {
@@ -299,6 +343,7 @@ void per_loop_maint(void)
 		} else {
 			active += statlist_count(&login_client_list);
 		}
+		/* fallthrough */
 	case P_PAUSE:
 		if (!active)
 			admin_pause_done();
@@ -308,6 +353,9 @@ void per_loop_maint(void)
 			admin_pause_done();
 		break;
 	}
+
+	if (partial_wait && !waiting_count)
+		admin_wait_close_done();
 }
 
 /* maintaining clients in pool */
@@ -439,7 +487,7 @@ static void check_pool_size(PgPool *pool)
 	    cf_reboot == 0 &&
 	    pool_client_count(pool) > 0)
 	{
-		log_debug("Launching new connection to satisfy min_pool_size");
+		log_debug("launching new connection to satisfy min_pool_size");
 		launch_new_connection(pool);
 	}
 }
@@ -448,7 +496,7 @@ static void check_pool_size(PgPool *pool)
 static void pool_server_maint(PgPool *pool)
 {
 	struct List *item, *tmp;
-	usec_t age, now = get_cached_time();
+	usec_t now = get_cached_time();
 	PgSocket *server;
 
 	/* find and disconnect idle servers */
@@ -456,19 +504,42 @@ static void pool_server_maint(PgPool *pool)
 	check_unused_servers(pool, &pool->tested_server_list, 0);
 	check_unused_servers(pool, &pool->idle_server_list, 1);
 
-	/* where query got did not get answer in query_timeout */
+	/* disconnect close_needed active servers if server_fast_close is set */
+	if (cf_server_fast_close) {
+		statlist_for_each_safe(item, &pool->active_server_list, tmp) {
+			server = container_of(item, PgSocket, head);
+			Assert(server->state == SV_ACTIVE);
+			if (server->ready && server->close_needed)
+				disconnect_server(server, true, "database configuration changed");
+		}
+	}
+
+	/* handle query_timeout and idle_transaction_timeout */
 	if (cf_query_timeout > 0 || cf_idle_transaction_timeout > 0) {
 		statlist_for_each_safe(item, &pool->active_server_list, tmp) {
+			usec_t age_client, age_server;
+
 			server = container_of(item, PgSocket, head);
 			Assert(server->state == SV_ACTIVE);
 			if (server->ready)
 				continue;
-			age = now - server->link->request_time;
-			if (cf_query_timeout > 0 && age > cf_query_timeout) {
+
+			/*
+			 * Note the different age calculations:
+			 * query_timeout counts from the last request
+			 * of the client (the client started the
+			 * query), idle_transaction_timeout counts
+			 * from the last request of the server (the
+			 * server sent the idle information).
+			 */
+			age_client = now - server->link->request_time;
+			age_server = now - server->request_time;
+
+			if (cf_query_timeout > 0 && age_client > cf_query_timeout) {
 				disconnect_server(server, true, "query timeout");
 			} else if (cf_idle_transaction_timeout > 0 &&
 				   server->idle_tx &&
-				   age > cf_idle_transaction_timeout)
+				   age_server > cf_idle_transaction_timeout)
 			{
 				disconnect_server(server, true, "idle transaction timeout");
 			}
@@ -478,6 +549,8 @@ static void pool_server_maint(PgPool *pool)
 	/* find connections that got connect, but could not log in */
 	if (cf_server_connect_timeout > 0) {
 		statlist_for_each_safe(item, &pool->new_server_list, tmp) {
+			usec_t age;
+
 			server = container_of(item, PgSocket, head);
 			Assert(server->state == SV_LOGIN);
 
@@ -533,7 +606,7 @@ static void cleanup_inactive_autodatabases(void)
 }
 
 /* full-scale maintenance, done only occasionally */
-static void do_full_maint(int sock, short flags, void *arg)
+static void do_full_maint(evutil_socket_t sock, short flags, void *arg)
 {
 	struct List *item, *tmp;
 	PgPool *pool;
@@ -546,7 +619,7 @@ static void do_full_maint(int sock, short flags, void *arg)
 	 * Avoid doing anything that may surprise other pgbouncer.
 	 */
 	if (cf_pause_mode == P_SUSPEND)
-		goto skip_maint;
+		return;
 
 	statlist_for_each_safe(item, &pool_list, tmp) {
 		pool = container_of(item, PgPool, head);
@@ -581,7 +654,7 @@ static void do_full_maint(int sock, short flags, void *arg)
 	if (cf_shutdown == 1 && get_active_server_count() == 0) {
 		log_info("server connections dropped, exiting");
 		cf_shutdown = 2;
-		event_loopbreak();
+		event_base_loopbreak(pgb_event_base);
 		return;
 	}
 
@@ -589,17 +662,14 @@ static void do_full_maint(int sock, short flags, void *arg)
 		loader_users_check();
 
 	adns_zone_cache_maint(adns);
-
-skip_maint:
-	safe_evtimer_add(&full_maint_ev, &full_maint_period);
 }
 
 /* first-time initialization */
 void janitor_setup(void)
 {
 	/* launch maintenance */
-	evtimer_set(&full_maint_ev, do_full_maint, NULL);
-	safe_evtimer_add(&full_maint_ev, &full_maint_period);
+	event_assign(&full_maint_ev, pgb_event_base, -1, EV_PERSIST, do_full_maint, NULL);
+	event_add(&full_maint_ev, &full_maint_period);
 }
 
 void kill_pool(PgPool *pool)
@@ -643,7 +713,7 @@ void kill_database(PgDatabase *db)
 	if (db->forced_user)
 		slab_free(user_cache, db->forced_user);
 	if (db->connect_query)
-		free((void *)db->connect_query);
+		free(db->connect_query);
 	if (db->inactive_time) {
 		statlist_remove(&autodatabase_idle_list, &db->head);
 	} else {
@@ -672,4 +742,3 @@ void config_postprocess(void)
 			db->res_pool_size = cf_res_pool_size;
 	}
 }
-

@@ -1,0 +1,3 @@
+test/hba_test.rules		-whitespace
+test/test.sh			whitespace=-blank-at-eol
+win32/eventmsg.rc		whitespace=-blank-at-eol
