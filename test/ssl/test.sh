@@ -35,7 +35,6 @@ BOUNCER_PORT=`sed -n '/^listen_port/s/listen_port.*=[^0-9]*//p' $BOUNCER_INI`
 BOUNCER_EXE="$BOUNCER_EXE_PREFIX ../../pgbouncer"
 
 LOGDIR=log
-PG_PORT=6666
 PG_LOG=$LOGDIR/pg.log
 
 pgctl() {
@@ -74,7 +73,7 @@ stopit pgdata/postmaster.pid
 
 mkdir -p $LOGDIR
 rm -f $BOUNCER_LOG $PG_LOG
-rm -rf $PGDATA
+#rm -rf $PGDATA
 
 if [  -d $PGDATA ]; then
 	#echo "initdb"
@@ -82,8 +81,8 @@ if [  -d $PGDATA ]; then
 	#initdb --nosync >> $PG_LOG 2>&1
 	#sed -r -i "/unix_socket_director/s:.*(unix_socket_director.*=).*:\\1 '/tmp':" pgdata/postgresql.conf
 	#echo "port = $PG_PORT" >> pgdata/postgresql.conf
-	echo "log_connections = on" >> ${PGDATA}/postgresql.conf
-	echo "log_disconnections = on" >> ${PGDATA}/postgresql.conf
+	#echo "log_connections = on" >> ${PGDATA}/postgresql.conf
+	#echo "log_disconnections = on" >> ${PGDATA}/postgresql.conf
 	cp ${PGDATA}/postgresql.conf ${PGDATA}/postgresql.conf.orig
 	cp ${PGDATA}/pg_hba.conf ${PGDATA}/pg_hba.conf.orig
 	cp ${PGDATA}/pg_ident.conf ${PGDATA}/pg_ident.conf.orig
@@ -255,7 +254,7 @@ test_client_ssl() {
 	return $rc
 }
 
-test_client_ssl_ca() {
+test_client_ssl_verify() {
 	reconf_bouncer "auth_type = trust" "server_tls_sslmode = prefer" \
 		"client_tls_sslmode = require" \
 		"client_tls_key_file = TestCA1/sites/01-localhost.key" \

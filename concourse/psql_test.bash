@@ -34,10 +34,7 @@ function _main(){
     chown -R gpadmin:gpadmin pgbouncer_src
 	echo "gpadmin ALL=(ALL)       NOPASSWD: ALL" >> /etc/sudoers
     cd pgbouncer_src/test
-    su  gpadmin -c "./test.sh"
-	su  gpadmin -c "make all"
-    cd ssl
-    su gpadmin -c "./test.sh"
+	su gpadmin -C "make check USE_SUDO=1 tls_support=yes"
 }
 
 _main "$@"

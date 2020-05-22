@@ -17,8 +17,10 @@ export PGDATA=$MASTER_DATA_DIRECTORY
 # PG_PORT is gpdb master server port and PGPORT will be set us pgboucer server port
 PG_PORT=${PGPORT}
 
-if [ ! -d $${PGDATA} ]; then
+if [ -d ${PGDATA} ]; then
+	cp ${PGDATA}/postgresql.conf ${PGDATA}/postgresql.conf.orig
 	cp ${PGDATA}/pg_hba.conf ${PGDATA}/pg_hba.conf.orig
+
 fi
 
 # replace port in test.ini
@@ -238,6 +240,7 @@ complete() {
 	test -f $BOUNCER_PID && kill `cat $BOUNCER_PID` >/dev/null 2>&1
 	rm -f $BOUNCER_PID
 	test -e userlist.txt.bak && mv userlist.txt.bak userlist.txt
+	cp ${PGDATA}/postgresql.conf.orig ${PGDATA}/postgresql.conf
 	cp ${PGDATA}/pg_hba.conf.orig ${PGDATA}/pg_hba.conf
 	rm test.ini
 	mv test.ini.orig test.ini
@@ -280,6 +283,16 @@ runtest() {
 	mv $BOUNCER_LOG $LOGDIR/$1.log
 
 	return $status
+}
+
+# gpdb doesn't support alter system, so use the following function to reconfig it
+reconf_pgsql() {
+	cp ${PGDATA}/postgresql.conf.orig ${PGDATA}/postgresql.conf
+	for ln in "$@"; do
+		echo "$ln" >> ${PGDATA}/postgresql.conf
+	done
+	gpstop  -u
+	#pg_ctl restart -w -t 3 -D $MASTER_DATA_DIRECTORY
 }
 
 # show version and --version
@@ -406,9 +419,7 @@ test_tcp_user_timeout() {
 
 # server_connect_timeout
 test_server_connect_timeout_establish() {
-	psql -X -p $PG_PORT -c "alter system set pre_auth_delay to '60s'" p0
-	#kill -HUP `head -n1 pgdata/postmaster.pid`
-	gpstop -aM fast
+	reconf_pgsql "pre_auth_delay=60"
 	sleep 1
 
 	admin "set query_timeout=3"
@@ -418,9 +429,7 @@ test_server_connect_timeout_establish() {
 	grep "closing because: connect timeout" $BOUNCER_LOG
 	rc=$?
 
-	rm -f ${PGDATA}/postgresql.auto.conf
-	kill -HUP `head -n1 pgdata/postmaster.pid`
-	gpstop -aM fast
+	reconf_pgsql 
 	sleep 1
 
 	return $rc
